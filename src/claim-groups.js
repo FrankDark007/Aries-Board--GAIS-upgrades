@@ -248,7 +248,8 @@ export function parseClient(value, staff = new Set()) {
 function parseTitleClientPrefix(rawTitle, staff) {
   const cleaned = cleanSubject(rawTitle)
   if (!cleaned) return null
-  const prefixMatch = /^([A-Za-z][A-Za-z .'-]{1,42}?)(?:\s*[:—–-]\s+|\s*,\s+\d)/.exec(cleaned)
+  const prefixMatch = /^([A-Za-z][A-Za-z .,'-]{1,42}?)(?:\s*[:—–-]\s+|\s*,\s+\d)/.exec(cleaned)
+    || /^([A-Za-z][A-Za-z'-]{2,24})\s+(?:claim|matter|file|loss|project|invoice|supplement|estimate|mitigation)\b/i.exec(cleaned)
   if (!prefixMatch) return null
   const candidate = prefixMatch[1].trim()
   const words = plain(candidate).split(/\s+/).filter(Boolean)
@@ -403,7 +404,7 @@ export function claimGroupDetails(items, options = {}) {
     let client = parseClient(brief.client, staff)
     let writtenClient = typeof brief.client === 'string' ? brief.client.replace(/\s+/g, ' ').trim() : ''
     if (!client) {
-      const fromTitle = parseTitleClientPrefix(brief.title || item.title, staff)
+      const fromTitle = parseTitleClientPrefix(item.title, staff) || parseTitleClientPrefix(brief.title, staff)
       if (fromTitle) {
         client = fromTitle.client
         writtenClient = fromTitle.label
@@ -460,7 +461,7 @@ export function claimGroupDetails(items, options = {}) {
   // Cards with an empty brief.client whose cleaned title mentions an unambiguous known client surname
   for (const item of open) {
     if (clients.get(item.id)) continue
-    const cleaned = plain(cleanSubject(item.brief?.title || item.title))
+    const cleaned = plain(`${cleanSubject(item.title)} ${cleanSubject(item.brief?.title || '')}`)
     const words = cleaned.match(/[a-z]{4,}/g) || []
     for (const word of words) {
       if (TITLE_STOP.has(word) || NOT_A_CLIENT.has(word) || staff.has(word)) continue
