@@ -1,4 +1,5 @@
 import express from 'express';
+import { createServer as createViteServer } from 'vite';
 import { FakeD1Database } from './test/fake-d1.js';
 import worker from './src/index.js';
 
@@ -231,56 +232,79 @@ async function seedDatabase() {
   );
 }
 
-const app = express();
-app.use(express.raw({ type: '*/*', limit: '5mb' }));
+async function startServer() {
+  await seedDatabase();
 
-app.use(async (req, res) => {
-  try {
-    const proto = (req.headers['x-forwarded-proto'] as string) || 'https';
-    const url = new URL(req.originalUrl || req.url, `${proto}://aries.flood.doctor`);
-    const headers = new Headers();
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === 'string') headers.set(key, value);
-      else if (Array.isArray(value)) headers.set(key, value.join(', '));
+  const app = express();
+  app.use('/api', express.raw({ type: '*/*', limit: '5mb' }));
+
+  const isWorkerRoute = (pathname: string) =>
+    pathname.startsWith('/api/') ||
+    pathname === '/card' ||
+    pathname === '/mission' ||
+    pathname === '/activity' ||
+    pathname === '/healthz';
+
+  app.use(async (req, res, next) => {
+    const pathname = (req.originalUrl || req.url).split('?')[0];
+    if (!isWorkerRoute(pathname)) {
+      return next();
     }
-    headers.set('host', 'aries.flood.doctor');
-    if (!headers.has('cf-access-authenticated-user-email')) {
+    try {
+      const proto = (req.headers['x-forwarded-proto'] as string) || 'https';
+      const url = new URL(req.originalUrl || req.url, `${proto}://aries.flood.doctor`);
       const asUser = url.searchParams.get('as_email') || 'darakhshan.farough@gmail.com';
-      headers.set('cf-access-authenticated-user-email', asUser);
+      url.searchParams.delete('as_email');
+
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (typeof value === 'string') headers.set(key, value);
+        else if (Array.isArray(value)) headers.set(key, value.join(', '));
+      }
+      headers.set('host', 'aries.flood.doctor');
+      if (!headers.has('cf-access-authenticated-user-email')) {
+        headers.set('cf-access-authenticated-user-email', asUser);
+      }
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        headers.set('origin', `${proto}://aries.flood.doctor`);
+      }
+
+      const body =
+        req.method === 'GET' || req.method === 'HEAD'
+          ? undefined
+          : Buffer.isBuffer(req.body) && req.body.length > 0
+            ? new Uint8Array(req.body)
+            : undefined;
+
+      const webReq = new Request(url.toString(), {
+        method: req.method,
+        headers,
+        body,
+      });
+
+      const webRes = await worker.fetch!(webReq, env);
+      res.status(webRes.status);
+      webRes.headers.forEach((val, key) => {
+        if (key.toLowerCase() === 'content-security-policy') return;
+        res.setHeader(key, val);
+      });
+      const arrayBuffer = await webRes.arrayBuffer();
+      res.send(Buffer.from(arrayBuffer));
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Internal Server Error' });
     }
-    if (req.method !== 'GET' && req.method !== 'HEAD' && !headers.has('origin')) {
-      headers.set('origin', 'https://aries.flood.doctor');
-    }
-
-    const body =
-      req.method === 'GET' || req.method === 'HEAD'
-        ? undefined
-        : Buffer.isBuffer(req.body) && req.body.length > 0
-          ? new Uint8Array(req.body)
-          : undefined;
-
-    const webReq = new Request(url.toString(), {
-      method: req.method,
-      headers,
-      body,
-    });
-
-    const webRes = await worker.fetch!(webReq, env);
-    res.status(webRes.status);
-    webRes.headers.forEach((val, key) => {
-      if (key.toLowerCase() === 'content-security-policy') return;
-      res.setHeader(key, val);
-    });
-    const arrayBuffer = await webRes.arrayBuffer();
-    res.send(Buffer.from(arrayBuffer));
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || 'Internal Server Error' });
-  }
-});
-
-const PORT = 3000;
-seedDatabase().then(() => {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Aries Cloud Dashboard Worker preview listening on http://localhost:${PORT}`);
   });
-});
+
+  const vite = await createViteServer({
+    server: { middlewareMode: true },
+    appType: 'spa',
+  });
+  app.use(vite.middlewares);
+
+  const PORT = 3000;
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Aries Cloud Dashboard running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
