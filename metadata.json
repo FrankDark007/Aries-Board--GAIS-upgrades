@@ -1,0 +1,6 @@
+{
+  "name": "Aries Cloud Dashboard Overhaul",
+  "description": "Production-ready Cloudflare Worker backend and Linear-inspired operational workspace for the Aries Cloud Operations Board & Shared To-Do v2.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
