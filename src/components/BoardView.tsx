@@ -1,19 +1,25 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
-  AlertCircle,
+  AlertTriangle,
+  ArchiveRestore,
+  Building2,
   CheckCircle2,
   Clock,
-  Filter,
+  Command,
+  DollarSign,
   FolderGit2,
   Inbox,
+  Keyboard,
   Layers,
   Mail,
   MoreHorizontal,
   PlayCircle,
   RefreshCw,
+  RotateCcw,
   Search,
   Sparkles,
   UserCheck,
+  Users,
   X,
   Zap,
 } from 'lucide-react';
@@ -45,6 +51,14 @@ export interface CardBrief {
   generated_at?: string;
 }
 
+export interface CommandReceipt {
+  id: number;
+  operation: string;
+  state: 'queued' | 'received' | 'applied' | 'acked' | 'failed' | 'expired' | string;
+  created_at?: string;
+  error?: string;
+}
+
 export interface BoardCardItem {
   id: number;
   title: string;
@@ -65,8 +79,11 @@ export interface BoardCardItem {
   auto_resolved_candidate?: boolean;
   claim_group?: string;
   claim_label?: string;
+  pending?: boolean;
+  command_receipt?: CommandReceipt | null;
   brief?: CardBrief | null;
   history?: Array<{ at: string; who: string; what: string; ours?: boolean; kind?: string }>;
+  notes?: Array<{ at: string; by: string; text: string }>;
   aries_task?: { status: string; at: string; finished_at?: string };
   prep?: { status: string; at: string; finished_at?: string };
 }
@@ -96,6 +113,8 @@ export interface BoardViewProps {
   onBulkDone: (ids: number[]) => Promise<void>;
   onMergeClaimDuplicates: (groupMembers: BoardCardItem[]) => Promise<void>;
   onOpenEmailThread: (card: BoardCardItem) => void;
+  onRetryCommand?: (commandId: number, cardId: number) => Promise<void>;
+  onOpenCommandPalette?: () => void;
 }
 
 const DONE_REASONS = [
@@ -151,6 +170,57 @@ export function getCardAgeDays(item: BoardCardItem): number {
 export function isStaleCard(item: BoardCardItem): boolean {
   if ((item.status || 'open') !== 'open') return false;
   return getCardAgeDays(item) > 7;
+}
+
+export function parseDollarAmount(raw?: string): number {
+  if (!raw) return 0;
+  const cleaned = String(raw).replace(/[^0-9.]/g, '');
+  const val = Number.parseFloat(cleaned);
+  return Number.isFinite(val) ? val : 0;
+}
+
+export function detectCarrier(item: BoardCardItem): string {
+  const brief = item.brief || {};
+  const haystack = [
+    item.title,
+    brief.title,
+    brief.waiting_on,
+    brief.deadline_note,
+    brief.last_theirs?.by,
+    brief.last_theirs?.what,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  if (haystack.includes('state farm')) return 'State Farm';
+  if (haystack.includes('travelers')) return 'Travelers';
+  if (haystack.includes('usaa')) return 'USAA';
+  if (haystack.includes('liberty mutual')) return 'Liberty Mutual';
+  if (haystack.includes('allstate')) return 'Allstate';
+  if (haystack.includes('nationwide')) return 'Nationwide';
+  if (haystack.includes('erie')) return 'Erie Insurance';
+  if (haystack.includes('chubb')) return 'Chubb';
+  return 'Direct / Other';
+}
+
+export function getSlaStatus(item: BoardCardItem): {
+  label: string;
+  tone: 'red' | 'amber' | 'slate' | null;
+} {
+  if (item.status === 'done' || isAutoResolved(item)) return { label: '', tone: null };
+  const brief = item.brief || {};
+  const waitingOn = String(brief.waiting_on || '').toLowerCase();
+  const waitingOnUs =
+    !waitingOn || /frank|mark|steve|katherine|shayan|shyon|dom|aries|office|us\b/i.test(waitingOn);
+  const ageDays = getCardAgeDays(item);
+
+  if (waitingOnUs) {
+    if (ageDays > 7) return { label: `SLA > 7d (${ageDays}d) · Escalate`, tone: 'red' };
+    if (ageDays >= 2) return { label: `SLA > 48h (${ageDays}d) · Waiting on Us`, tone: 'amber' };
+    return { label: 'Waiting on Us', tone: 'amber' };
+  }
+  return { label: `Awaiting ${brief.waiting_on}`, tone: 'slate' };
 }
 
 export function formatMailboxPill(item: BoardCardItem): string {
@@ -222,20 +292,31 @@ export const BoardView: React.FC<BoardViewProps> = ({
   onBulkDone,
   onMergeClaimDuplicates,
   onOpenEmailThread,
+  onRetryCommand,
+  onOpenCommandPalette,
 }) => {
   const [quickFilter, setQuickFilter] = useState<'all' | 'mine' | 'ready' | 'urgent' | 'unassigned' | 'stale'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [ownerFilter, setOwnerFilter] = useState('');
+  const [carrierFilter, setCarrierFilter] = useState('');
   const [sortBy, setSortBy] = useState<KanbanSortOption>('urgent');
   const [groupByClaim, setGroupByClaim] = useState(true);
+  const [showFinancialRollup, setShowFinancialRollup] = useState(true);
+  const [showRecoveryDrawer, setShowRecoveryDrawer] = useState(false);
+  const [showKeyboardHelp, setShowKeyboardHelp] = useState(false);
+
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [expandedCards, setExpandedCards] = useState<Set<number>>(new Set());
+  const [focusedCardId, setFocusedCardId] = useState<number | null>(null);
   const [openMenuCardId, setOpenMenuCardId] = useState<number | null>(null);
   const [openSnoozeCardId, setOpenSnoozeCardId] = useState<number | null>(null);
   const [draggedCardId, setDraggedCardId] = useState<number | null>(null);
   const [dragOverColumn, setDragOverColumn] = useState<KanbanStatus | null>(null);
+  const [dragOverOwner, setDragOverOwner] = useState<string | null>(null);
 
   const activeItems = useMemo(() => items.filter((item) => item.status !== 'snoozed'), [items]);
+  const snoozedItems = useMemo(() => items.filter((item) => item.status === 'snoozed'), [items]);
+  const completedItems = useMemo(() => items.filter((item) => item.status === 'done'), [items]);
 
   const counts = useMemo(() => {
     const open = activeItems.filter((i) => i.status !== 'done');
@@ -249,6 +330,60 @@ export const BoardView: React.FC<BoardViewProps> = ({
     };
   }, [activeItems, viewer]);
 
+  // Enhancement 2: Team Workload & SLA Heatmap metrics
+  const teamWorkload = useMemo(() => {
+    const open = activeItems.filter((i) => i.status !== 'done');
+    const roster = [
+      { key: '__unassigned__', name: 'Unassigned' },
+      ...team,
+      { key: 'aries', name: 'Aries AI' },
+    ];
+    return roster.map((member) => {
+      const assignedCards = open.filter((card) => {
+        const owner = String(card.assignee || '').trim().toLowerCase();
+        return member.key === '__unassigned__' ? owner === '' : owner === member.key.toLowerCase();
+      });
+      const urgentCount = assignedCards.filter(isUrgentCard).length;
+      const slaBreachCount = assignedCards.filter((c) => getSlaStatus(c).tone === 'red').length;
+      return {
+        ...member,
+        count: assignedCards.length,
+        urgentCount,
+        slaBreachCount,
+      };
+    });
+  }, [activeItems, team]);
+
+  // Enhancement 4: Financial & Carrier Exposure Roll-Up
+  const financialRollup = useMemo(() => {
+    const open = activeItems.filter((i) => i.status !== 'done');
+    let totalOpenExposure = 0;
+    let readyToCloseValue = 0;
+    let urgentExposure = 0;
+    const byCarrier = new Map<string, { carrier: string; amount: number; count: number; urgentCount: number }>();
+
+    for (const card of open) {
+      const amt = parseDollarAmount(card.brief?.amount);
+      totalOpenExposure += amt;
+      if (isAutoResolved(card)) readyToCloseValue += amt;
+      if (isUrgentCard(card)) urgentExposure += amt;
+
+      const carrier = detectCarrier(card);
+      const current = byCarrier.get(carrier) || { carrier, amount: 0, count: 0, urgentCount: 0 };
+      current.amount += amt;
+      current.count += 1;
+      if (isUrgentCard(card)) current.urgentCount += 1;
+      byCarrier.set(carrier, current);
+    }
+
+    return {
+      totalOpenExposure,
+      readyToCloseValue,
+      urgentExposure,
+      carriers: Array.from(byCarrier.values()).sort((a, b) => b.amount - a.amount),
+    };
+  }, [activeItems]);
+
   const filteredItems = useMemo(() => {
     return activeItems.filter((item) => {
       const owner = String(item.assignee || '').toLowerCase();
@@ -261,6 +396,8 @@ export const BoardView: React.FC<BoardViewProps> = ({
       if (ownerFilter === '__unassigned__' && owner !== '') return false;
       if (ownerFilter && ownerFilter !== '__unassigned__' && owner !== ownerFilter.toLowerCase()) return false;
 
+      if (carrierFilter && detectCarrier(item) !== carrierFilter) return false;
+
       const q = searchQuery.trim().toLowerCase();
       if (!q) return true;
       const brief = item.brief || {};
@@ -272,6 +409,7 @@ export const BoardView: React.FC<BoardViewProps> = ({
         brief.claim,
         brief.next_step,
         brief.waiting_on,
+        brief.amount,
         item.mailbox,
         item.source_account,
         item.claim_label,
@@ -281,7 +419,7 @@ export const BoardView: React.FC<BoardViewProps> = ({
         .toLowerCase();
       return haystack.includes(q);
     });
-  }, [activeItems, quickFilter, ownerFilter, searchQuery, viewer]);
+  }, [activeItems, quickFilter, ownerFilter, carrierFilter, searchQuery, viewer]);
 
   const columnsData = useMemo(() => {
     const map: Record<KanbanStatus, BoardCardItem[]> = {
@@ -302,7 +440,7 @@ export const BoardView: React.FC<BoardViewProps> = ({
     };
     const getAssigneeLabel = (card: BoardCardItem): string => {
       const key = String(card.assignee || '').trim().toLowerCase();
-      if (!key) return '\uffff'; // Sort unassigned after assigned
+      if (!key) return '\uffff';
       return ownerNameMap.get(key) || key;
     };
 
@@ -322,7 +460,6 @@ export const BoardView: React.FC<BoardViewProps> = ({
           if (urgDiff !== 0) return urgDiff;
           return b.id - a.id;
         }
-        // Default: 'urgent'
         const urgDiff = Number(isUrgentCard(b)) - Number(isUrgentCard(a));
         if (urgDiff !== 0) return urgDiff;
         const timeDiff = getCreatedTime(b) - getCreatedTime(a);
@@ -332,6 +469,73 @@ export const BoardView: React.FC<BoardViewProps> = ({
     }
     return map;
   }, [filteredItems, sortBy, team]);
+
+  const orderedVisibleCards = useMemo(() => {
+    return [...columnsData.Open, ...columnsData['In Progress'], ...columnsData.Resolved];
+  }, [columnsData]);
+
+  // Enhancement 1: Linear-style Keyboard Shortcuts (J/K, D/E, U, S, M/Enter, ?)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      if (e.key === '?') {
+        e.preventDefault();
+        setShowKeyboardHelp((prev) => !prev);
+        return;
+      }
+
+      if (!orderedVisibleCards.length) return;
+      const currentIdx = focusedCardId
+        ? orderedVisibleCards.findIndex((c) => c.id === focusedCardId)
+        : -1;
+
+      if (e.key === 'j' || e.key === 'J') {
+        e.preventDefault();
+        const nextIdx = currentIdx < orderedVisibleCards.length - 1 ? currentIdx + 1 : 0;
+        setFocusedCardId(orderedVisibleCards[nextIdx].id);
+        return;
+      }
+      if (e.key === 'k' || e.key === 'K') {
+        e.preventDefault();
+        const prevIdx = currentIdx > 0 ? currentIdx - 1 : orderedVisibleCards.length - 1;
+        setFocusedCardId(orderedVisibleCards[prevIdx].id);
+        return;
+      }
+
+      const activeCard =
+        (focusedCardId && orderedVisibleCards.find((c) => c.id === focusedCardId)) ||
+        orderedVisibleCards[0];
+      if (!activeCard) return;
+
+      if (e.key === 'd' || e.key === 'D' || e.key === 'e' || e.key === 'E') {
+        e.preventDefault();
+        if (activeCard.status !== 'done') onCardDone(activeCard);
+      } else if (e.key === 'u' || e.key === 'U') {
+        e.preventDefault();
+        onCardUrgent(activeCard, !isUrgentCard(activeCard));
+      } else if (e.key === 's' || e.key === 'S') {
+        e.preventDefault();
+        onCardSnooze(activeCard, isoDateDaysFromNow(1));
+      } else if (e.key === 'm' || e.key === 'M' || e.key === 'Enter') {
+        e.preventDefault();
+        onOpenEmailThread(activeCard);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [orderedVisibleCards, focusedCardId, onCardDone, onCardUrgent, onCardSnooze, onOpenEmailThread]);
 
   const claimGroupsMap = useMemo(() => {
     const map = new Map<string, BoardCardItem[]>();
@@ -372,6 +576,62 @@ export const BoardView: React.FC<BoardViewProps> = ({
     await onCardStageChange(card, targetColumn);
   };
 
+  const handleDropOnOwnerPill = async (ownerKey: string) => {
+    setDragOverOwner(null);
+    if (draggedCardId === null) return;
+    const card = items.find((i) => i.id === draggedCardId);
+    setDraggedCardId(null);
+    if (!card) return;
+    const targetOwner = ownerKey === '__unassigned__' ? '' : ownerKey;
+    await onCardAssign(card, targetOwner);
+  };
+
+  const renderSyncReceiptBadge = (item: BoardCardItem) => {
+    const receipt = item.command_receipt;
+    if (!receipt) return null;
+    const state = receipt.state;
+    if (state === 'failed' || state === 'expired') {
+      return (
+        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-50 text-red-700 border border-red-200">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-600" />
+          Sync {state}
+          {onRetryCommand && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRetryCommand(receipt.id, item.id);
+              }}
+              className="ml-1 underline hover:text-red-900 cursor-pointer"
+            >
+              Retry
+            </button>
+          )}
+        </span>
+      );
+    }
+    if (state === 'queued' || state === 'received') {
+      return (
+        <span
+          title={`Command #${receipt.id} (${receipt.operation}) is ${state} in D1`}
+          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200"
+        >
+          <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+          {state === 'queued' ? 'Queued in D1' : 'Leased by Aries'}
+        </span>
+      );
+    }
+    return (
+      <span
+        title={`Command #${receipt.id} applied`}
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-600"
+      >
+        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+        Synced
+      </span>
+    );
+  };
+
   const renderCard = (item: BoardCardItem, column: KanbanStatus) => {
     const brief = item.brief || {};
     const resolvedCandidate = isAutoResolved(item);
@@ -381,27 +641,35 @@ export const BoardView: React.FC<BoardViewProps> = ({
     const mailboxPill = formatMailboxPill(item);
     const isExpanded = expandedCards.has(item.id);
     const isSelected = selectedIds.has(item.id);
+    const isFocused = focusedCardId === item.id;
     const hasEmail = threadIds.has(item.id);
     const groupSiblings = item.claim_group ? claimGroupsMap.get(item.claim_group) || [] : [];
+    const sla = getSlaStatus(item);
 
     return (
       <article
         key={item.id}
         draggable
+        onClick={() => setFocusedCardId(item.id)}
         onDragStart={() => setDraggedCardId(item.id)}
         onDragEnd={() => {
           setDraggedCardId(null);
           setDragOverColumn(null);
+          setDragOverOwner(null);
         }}
         data-id={item.id}
         data-status={item.status || 'open'}
-        className={`group relative rounded-lg bg-white border border-slate-200 shadow-2xs hover:border-slate-300 transition-all ${getAccentBorderClass(
+        className={`group relative rounded-lg bg-white border transition-all ${getAccentBorderClass(
           item,
           column
-        )} ${isDone ? 'opacity-75 bg-slate-50/70' : ''}`}
+        )} ${
+          isFocused
+            ? 'border-blue-500 ring-2 ring-blue-500/30 shadow-sm'
+            : 'border-slate-200 shadow-2xs hover:border-slate-300'
+        } ${isDone ? 'opacity-75 bg-slate-50/70' : ''}`}
       >
         <div className="p-3.5 space-y-2.5">
-          {/* Card Header: #ID · Client/Claim · Mailbox Pill · Age/Deadline · Owner Dropdown */}
+          {/* Card Header: #ID · Client/Claim · Mailbox Pill · Amount · Owner Dropdown */}
           <div className="flex flex-wrap items-center justify-between gap-1.5">
             <div className="flex flex-wrap items-center gap-1.5 min-w-0">
               <input
@@ -414,9 +682,15 @@ export const BoardView: React.FC<BoardViewProps> = ({
               <span className="font-mono text-xs font-bold text-slate-600 tabular-nums">#{item.id}</span>
 
               {(brief.client || brief.claim || item.claim_label) && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-semibold bg-blue-50 text-blue-800 border border-blue-200/80 truncate max-w-[210px]">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-semibold bg-blue-50 text-blue-800 border border-blue-200/80 truncate max-w-[200px]">
                   {brief.client || item.claim_label}
                   {brief.claim ? ` · ${/^(invoice|claim)/i.test(brief.claim) ? brief.claim : `Claim ${brief.claim}`}` : ''}
+                </span>
+              )}
+
+              {brief.amount && (
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-mono font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 tabular-nums">
+                  {brief.amount}
                 </span>
               )}
 
@@ -435,6 +709,8 @@ export const BoardView: React.FC<BoardViewProps> = ({
                   Handled in email
                 </span>
               )}
+
+              {renderSyncReceiptBadge(item)}
             </div>
 
             {/* Inline Owner Selector Dropdown right in header */}
@@ -472,7 +748,7 @@ export const BoardView: React.FC<BoardViewProps> = ({
           {/* Card Body: Bold cleaned title + 1-line Next Step box */}
           <div>
             <h4
-              onClick={() => toggleExpand(item.id)}
+              onClick={() => onOpenEmailThread(item)}
               className={`text-sm font-semibold text-slate-900 leading-snug cursor-pointer hover:text-blue-700 ${
                 isDone ? 'line-through text-slate-500' : ''
               }`}
@@ -488,9 +764,9 @@ export const BoardView: React.FC<BoardViewProps> = ({
             )}
           </div>
 
-          {/* Metadata Strip: Age / Deadline / Waiting On */}
+          {/* Metadata Strip: Age / Deadline / SLA Escalation Badge */}
           <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 font-medium">
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
               {brief.deadline || item.due ? (
                 <span className="inline-flex items-center gap-1 text-amber-700 font-semibold tabular-nums">
                   <Clock className="w-3 h-3" />
@@ -501,9 +777,18 @@ export const BoardView: React.FC<BoardViewProps> = ({
                   Open {ageDays}d
                 </span>
               )}
-              {brief.waiting_on && (
-                <span className="truncate max-w-[160px]" title={`Waiting on: ${brief.waiting_on}`}>
-                  · Waiting on <strong className="text-slate-700">{brief.waiting_on}</strong>
+
+              {sla.tone && (
+                <span
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                    sla.tone === 'red'
+                      ? 'bg-red-50 text-red-700 border-red-200'
+                      : sla.tone === 'amber'
+                        ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : 'bg-slate-100 text-slate-600 border-slate-200'
+                  }`}
+                >
+                  {sla.label}
                 </span>
               )}
             </div>
@@ -545,7 +830,7 @@ export const BoardView: React.FC<BoardViewProps> = ({
             </div>
           )}
 
-          {/* Collapsed-Ready Quick Actions Bar (1-Click Done, Snooze, Email, Stage Move, More) */}
+          {/* Collapsed-Ready Quick Actions Bar (1-Click Done, Snooze, Inspector/Email, Stage Move, More) */}
           <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-1.5">
             <div className="flex flex-wrap items-center gap-1">
               {!isDone ? (
@@ -598,17 +883,19 @@ export const BoardView: React.FC<BoardViewProps> = ({
                 )}
               </div>
 
-              {/* Email Thread Button */}
-              {hasEmail && (
-                <button
-                  type="button"
-                  onClick={() => onOpenEmailThread(item)}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-semibold bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200/70 transition-colors cursor-pointer"
-                >
-                  <Mail className="w-3 h-3" />
-                  ✉️ Email
-                </button>
-              )}
+              {/* Split-Pane Email & Claim Inspector Button */}
+              <button
+                type="button"
+                onClick={() => onOpenEmailThread(item)}
+                className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-semibold border transition-colors cursor-pointer ${
+                  hasEmail
+                    ? 'bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200/70'
+                    : 'bg-slate-50 hover:bg-slate-100 text-slate-600 border-slate-200/70'
+                }`}
+              >
+                <Mail className="w-3 h-3" />
+                {hasEmail ? '✉️ Email' : 'Inspect'}
+              </button>
             </div>
 
             {/* Stage Transition & More Menu */}
@@ -706,7 +993,6 @@ export const BoardView: React.FC<BoardViewProps> = ({
       return colItems.map((item) => renderCard(item, column));
     }
 
-    // Group cards sharing a claim_group within the same column
     const renderedGroups = new Set<string>();
     const elements: React.ReactNode[] = [];
 
@@ -751,13 +1037,36 @@ export const BoardView: React.FC<BoardViewProps> = ({
               >
                 ✓ Complete All ({allGroupMembers.length})
               </button>
+              <select
+                aria-label={`Assign all cards in ${item.claim_label || groupKey}`}
+                defaultValue=""
+                onChange={async (e) => {
+                  const val = e.target.value;
+                  if (!val) return;
+                  e.target.value = '';
+                  const ownerKey = val === '__unassigned__' ? '' : val;
+                  for (const member of allGroupMembers) {
+                    await onCardAssign(member, ownerKey);
+                  }
+                }}
+                className="h-5 px-1.5 rounded text-[11px] font-semibold bg-white hover:bg-slate-50 text-slate-800 border border-blue-200 cursor-pointer"
+              >
+                <option value="">Assign All...</option>
+                {team.map((m) => (
+                  <option key={m.key} value={m.key}>
+                    {m.name}
+                  </option>
+                ))}
+                <option value="aries">Aries (AI)</option>
+                <option value="__unassigned__">Unassigned</option>
+              </select>
               {allGroupMembers.length > 1 && (
                 <button
                   type="button"
                   onClick={() => onMergeClaimDuplicates(allGroupMembers)}
                   className="px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300/80 cursor-pointer"
                 >
-                  Merge Duplicates
+                  Merge & Close Older Duplicates ({allGroupMembers.length - 1})
                 </button>
               )}
             </div>
@@ -843,6 +1152,162 @@ export const BoardView: React.FC<BoardViewProps> = ({
         </div>
       )}
 
+      {/* Enhancement 4: Financial & Carrier Exposure Roll-Up Strip */}
+      {showFinancialRollup && (
+        <div className="p-3.5 rounded-xl bg-white border border-slate-200 shadow-2xs space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center justify-center w-6 h-6 rounded-md bg-emerald-100 text-emerald-800">
+                <DollarSign className="w-3.5 h-3.5" />
+              </span>
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800">
+                  Financial & Carrier Exposure Roll-Up
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  Click any carrier below to isolate their open claims, invoices, and supplements.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-4 text-xs">
+              <div>
+                <span className="text-slate-500">Open Receivables: </span>
+                <strong className="font-mono font-bold text-slate-900 tabular-nums">
+                  ${financialRollup.totalOpenExposure.toLocaleString()}
+                </strong>
+              </div>
+              <div>
+                <span className="text-slate-500">Urgent Exposure: </span>
+                <strong className="font-mono font-bold text-red-600 tabular-nums">
+                  ${financialRollup.urgentExposure.toLocaleString()}
+                </strong>
+              </div>
+              <div>
+                <span className="text-slate-500">Ready to Close: </span>
+                <strong className="font-mono font-bold text-emerald-700 tabular-nums">
+                  ${financialRollup.readyToCloseValue.toLocaleString()}
+                </strong>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowFinancialRollup(false)}
+                className="text-slate-400 hover:text-slate-700 text-xs font-semibold cursor-pointer"
+              >
+                Hide
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            {financialRollup.carriers.map((c) => {
+              const active = carrierFilter === c.carrier;
+              return (
+                <button
+                  key={c.carrier}
+                  type="button"
+                  onClick={() => setCarrierFilter(active ? '' : c.carrier)}
+                  className={`p-2.5 rounded-lg border text-left transition-all cursor-pointer ${
+                    active
+                      ? 'bg-blue-50/90 border-blue-500 ring-1 ring-blue-500'
+                      : 'bg-slate-50/70 hover:bg-slate-100/80 border-slate-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-xs font-bold text-slate-800 truncate">{c.carrier}</span>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-white text-slate-700 border border-slate-200 tabular-nums">
+                      {c.count} {c.count === 1 ? 'card' : 'cards'}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex items-baseline justify-between">
+                    <span className="text-sm font-mono font-extrabold text-slate-900 tabular-nums">
+                      ${c.amount.toLocaleString()}
+                    </span>
+                    {c.urgentCount > 0 && (
+                      <span className="text-[10px] font-bold text-red-600">
+                        {c.urgentCount} urgent
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Enhancement 2: Team Workload & SLA Aging Heatmap Bar (Click to filter, Drag & Drop card to assign) */}
+      <div className="p-3 rounded-xl bg-white border border-slate-200 shadow-2xs flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Team workload heatmap">
+          <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mr-1 flex items-center gap-1">
+            <Users className="w-3.5 h-3.5" />
+            Workload (Drop card to assign):
+          </span>
+          {teamWorkload.map((member) => {
+            const isSelected = ownerFilter === member.key;
+            const isDragTarget = dragOverOwner === member.key;
+            return (
+              <button
+                key={member.key}
+                type="button"
+                onClick={() => setOwnerFilter(isSelected ? '' : member.key)}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  if (dragOverOwner !== member.key) setDragOverOwner(member.key);
+                }}
+                onDragLeave={() => {
+                  if (dragOverOwner === member.key) setDragOverOwner(null);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  handleDropOnOwnerPill(member.key);
+                }}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-all cursor-pointer ${
+                  isDragTarget
+                    ? 'bg-blue-100 border-blue-500 ring-2 ring-blue-400 scale-105'
+                    : isSelected
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                }`}
+              >
+                <span>{member.name}</span>
+                <span
+                  className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold tabular-nums ${
+                    isSelected ? 'bg-white/20 text-white' : 'bg-slate-200/80 text-slate-800'
+                  }`}
+                >
+                  {member.count}
+                </span>
+                {member.urgentCount > 0 && (
+                  <span
+                    title={`${member.urgentCount} urgent`}
+                    className="px-1 py-0.2 rounded text-[10px] font-bold bg-red-600 text-white tabular-nums"
+                  >
+                    {member.urgentCount}!
+                  </span>
+                )}
+                {member.slaBreachCount > 0 && (
+                  <span
+                    title={`${member.slaBreachCount} SLA > 7d`}
+                    className="w-2 h-2 rounded-full bg-amber-500"
+                  />
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {!showFinancialRollup && (
+          <button
+            type="button"
+            onClick={() => setShowFinancialRollup(true)}
+            className="text-xs font-semibold text-emerald-700 hover:text-emerald-800 cursor-pointer"
+          >
+            + Show Financial Roll-Up
+          </button>
+        )}
+      </div>
+
       {/* Filter & Triage Bar */}
       <div className="p-3.5 rounded-xl bg-white border border-slate-200 shadow-2xs space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -874,8 +1339,49 @@ export const BoardView: React.FC<BoardViewProps> = ({
             })}
           </div>
 
-          {/* Right Controls: Claim Consolidation Toggle + Refresh */}
-          <div className="flex items-center gap-2">
+          {/* Right Controls: ⌘K Jump, Keyboard Shortcuts, Recovery Drawer, Group Claims, Refresh */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            {onOpenCommandPalette && (
+              <button
+                type="button"
+                onClick={onOpenCommandPalette}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 cursor-pointer"
+              >
+                <Command className="w-3.5 h-3.5" />
+                <span>Jump</span>
+                <kbd className="px-1 py-0.2 rounded bg-white border border-slate-300 text-[10px] font-mono">
+                  ⌘K
+                </kbd>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setShowKeyboardHelp((prev) => !prev)}
+              title="Keyboard shortcuts (?)"
+              className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-semibold border cursor-pointer ${
+                showKeyboardHelp
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <Keyboard className="w-3.5 h-3.5" />
+              Shortcuts
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowRecoveryDrawer((prev) => !prev)}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border transition-colors cursor-pointer ${
+                showRecoveryDrawer
+                  ? 'bg-amber-50 text-amber-900 border-amber-300'
+                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <ArchiveRestore className="w-3.5 h-3.5" />
+              Snoozed / Closed ({snoozedItems.length + completedItems.length})
+            </button>
+
             <button
               type="button"
               onClick={() => setGroupByClaim(!groupByClaim)}
@@ -888,6 +1394,7 @@ export const BoardView: React.FC<BoardViewProps> = ({
               <Layers className="w-3.5 h-3.5" />
               Group Claims
             </button>
+
             <button
               type="button"
               onClick={onRefresh}
@@ -900,7 +1407,44 @@ export const BoardView: React.FC<BoardViewProps> = ({
           </div>
         </div>
 
-        {/* Search, Owner Filter & Bulk Selection Actions */}
+        {/* Keyboard Shortcuts Cheat-Sheet Bar */}
+        {showKeyboardHelp && (
+          <div className="p-2.5 rounded-lg bg-slate-900 text-slate-100 text-xs flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="font-bold text-white">Keyboard Triage:</span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">J</kbd> /{' '}
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">K</kbd> Navigate cards
+              </span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">D</kbd> or{' '}
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">E</kbd> Mark Done
+              </span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">U</kbd> Toggle Urgent
+              </span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">S</kbd> Snooze 1d
+              </span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">M</kbd> /{' '}
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">Enter</kbd> Open Inspector
+              </span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">⌘K</kbd> Command Palette
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowKeyboardHelp(false)}
+              className="text-slate-400 hover:text-white cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* Search, Owner Filter, Sort Dropdown & Bulk Selection Actions */}
         <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100">
           <div className="flex flex-wrap items-center gap-2 flex-1 min-w-[240px]">
             <div className="relative flex-1 max-w-xs">
@@ -947,13 +1491,14 @@ export const BoardView: React.FC<BoardViewProps> = ({
               </select>
             </div>
 
-            {(quickFilter !== 'all' || searchQuery || ownerFilter || sortBy !== 'urgent') && (
+            {(quickFilter !== 'all' || searchQuery || ownerFilter || carrierFilter || sortBy !== 'urgent') && (
               <button
                 type="button"
                 onClick={() => {
                   setQuickFilter('all');
                   setSearchQuery('');
                   setOwnerFilter('');
+                  setCarrierFilter('');
                   setSortBy('urgent');
                 }}
                 className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold text-slate-500 hover:text-slate-800 cursor-pointer"
@@ -994,6 +1539,95 @@ export const BoardView: React.FC<BoardViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Enhancement 5: Snoozed & Recently Closed Recovery Drawer */}
+      {showRecoveryDrawer && (
+        <div className="p-4 rounded-xl bg-white border border-amber-200 shadow-2xs space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">
+                Snoozed & Recently Closed Recovery Queue
+              </h3>
+              <p className="text-xs text-slate-500">
+                Wake snoozed cards early or bring recently checked-off cards back to the active board.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowRecoveryDrawer(false)}
+              className="text-xs font-semibold text-slate-500 hover:text-slate-800 cursor-pointer"
+            >
+              Close ✕
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Snoozed List */}
+            <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
+              <div className="text-xs font-bold text-amber-800 flex items-center justify-between">
+                <span>Snoozed / Returning Soon ({snoozedItems.length})</span>
+              </div>
+              {snoozedItems.length === 0 ? (
+                <p className="text-xs text-slate-400 py-2">No cards are currently snoozed.</p>
+              ) : (
+                snoozedItems.map((item) => (
+                  <div
+                    key={item.id}
+                    className="p-2.5 rounded bg-white border border-slate-200 flex items-center justify-between gap-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-slate-800 truncate">
+                        #{item.id} · {cardTitle(item)}
+                      </div>
+                      <div className="text-[11px] text-amber-700 font-medium">
+                        Returns on {item.due || 'scheduled date'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onCardReopen(item)}
+                      className="px-2.5 py-1 rounded text-xs font-semibold bg-amber-100 hover:bg-amber-200 text-amber-900 shrink-0 cursor-pointer"
+                    >
+                      Wake Now
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Recently Closed List */}
+            <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
+              <div className="text-xs font-bold text-emerald-800 flex items-center justify-between">
+                <span>Recently Completed ({completedItems.length})</span>
+              </div>
+              {completedItems.length === 0 ? (
+                <p className="text-xs text-slate-400 py-2">No cards marked done in this session yet.</p>
+              ) : (
+                completedItems.slice(0, 8).map((item) => (
+                  <div
+                    key={item.id}
+                    className="p-2.5 rounded bg-white border border-slate-200 flex items-center justify-between gap-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold text-slate-600 line-through truncate">
+                        #{item.id} · {cardTitle(item)}
+                      </div>
+                      {renderSyncReceiptBadge(item)}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onCardReopen(item)}
+                      className="px-2.5 py-1 rounded text-xs font-semibold bg-slate-200 hover:bg-slate-300 text-slate-800 shrink-0 cursor-pointer"
+                    >
+                      ↺ Reopen
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Primary 3-Column Kanban Layout: Open | In Progress | Resolved */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">

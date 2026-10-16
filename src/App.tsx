@@ -7,21 +7,26 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   CheckCircle2,
   CheckSquare,
+  Command,
+  FolderGit2,
   Kanban,
-  ListChecks,
   Mail,
+  MessageSquarePlus,
   Plus,
-  ShieldCheck,
+  Search,
+  Send,
   Sparkles,
   Undo2,
   Users,
   X,
+  Zap,
 } from 'lucide-react';
 import BoardView, {
   BoardCardItem,
   KanbanStatus,
   TeamMember,
   cardTitle,
+  detectCarrier,
   isAutoResolved,
   isUrgentCard,
 } from './components/BoardView';
@@ -45,25 +50,6 @@ interface ThreadPayload {
   subject: string;
   messages: Array<{ from: string; to?: string; date: string; body: string }>;
 }
-
-const TODO_NICKNAMES: Record<string, string> = {
-  tom: 'thomas',
-  tommy: 'thomas',
-  mike: 'michael',
-  bob: 'robert',
-  bobby: 'robert',
-  rob: 'robert',
-  bill: 'william',
-  will: 'william',
-  jim: 'james',
-  liz: 'elizabeth',
-  beth: 'elizabeth',
-  dave: 'david',
-  steve: 'steven',
-  kate: 'katherine',
-  katie: 'katherine',
-  sue: 'susan',
-};
 
 function extractCanonicalSurname(rawClient?: string): string | null {
   const cleaned = String(rawClient || '')
@@ -103,7 +89,6 @@ export default function App() {
   const [viewer, setViewer] = useState<TeamMember | null>({ key: 'frank', name: 'Frank' });
   const [activeEmailIdentity, setActiveEmailIdentity] = useState<string>('darakhshan.farough@gmail.com');
   const [threadIds, setThreadIds] = useState<Set<number>>(new Set());
-  const [publishedAt, setPublishedAt] = useState<string | null>(null);
   const [isStaleSnapshot, setIsStaleSnapshot] = useState<boolean>(false);
   const [loadingBoard, setLoadingBoard] = useState<boolean>(true);
 
@@ -114,10 +99,16 @@ export default function App() {
   const [newTodoClient, setNewTodoClient] = useState('');
   const [newTodoAssignee, setNewTodoAssignee] = useState('');
 
-  // Email Thread Modal state
-  const [activeThreadCard, setActiveThreadCard] = useState<BoardCardItem | null>(null);
+  // Enhancement 3: Split-Pane Claim & Email Inspector Slide-Over Drawer state
+  const [inspectorCard, setInspectorCard] = useState<BoardCardItem | null>(null);
   const [activeThreadData, setActiveThreadData] = useState<ThreadPayload | null>(null);
   const [loadingThread, setLoadingThread] = useState<boolean>(false);
+  const [inspectorNoteText, setInspectorNoteText] = useState('');
+  const [prepDraftInstruction, setPrepDraftInstruction] = useState('');
+
+  // Enhancement 1: Global Command Palette (`⌘K`) state
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState<boolean>(false);
+  const [commandQuery, setCommandQuery] = useState<string>('');
 
   // Toast with 5-second Undo
   const [toast, setToast] = useState<{
@@ -135,6 +126,22 @@ export default function App() {
     const timer = window.setTimeout(() => setToast(null), 5000);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  // Global ⌘K / Ctrl+K shortcut listener
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCommandPaletteOpen((prev) => !prev);
+        setCommandQuery('');
+      } else if (e.key === 'Escape') {
+        if (commandPaletteOpen) setCommandPaletteOpen(false);
+        else if (inspectorCard) setInspectorCard(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [commandPaletteOpen, inspectorCard]);
 
   const apiFetch = useCallback(
     async (path: string, init?: RequestInit) => {
@@ -155,7 +162,6 @@ export default function App() {
       if (Array.isArray(data.team) && data.team.length) setTeam(data.team);
       if (data.me) setViewer(data.me);
       setThreadIds(new Set(Array.isArray(data.thread_ids) ? data.thread_ids.map(Number) : []));
-      setPublishedAt(data.published_at || null);
       setIsStaleSnapshot(Boolean(data.stale?.is_stale));
     } catch (err: any) {
       showToast(err?.message || 'Unable to load board', true);
@@ -207,17 +213,33 @@ export default function App() {
     async (card: BoardCardItem, reason?: string) => {
       const prevStatus = card.status;
       const prevStage = stageOverrides[card.id];
+      const optimisticReceipt = {
+        id: Date.now(),
+        operation: 'done',
+        state: 'queued',
+      };
       setBoardItems((prev) =>
-        prev.map((item) => (item.id === card.id ? { ...item, status: 'done' } : item))
+        prev.map((item) =>
+          item.id === card.id
+            ? { ...item, status: 'done', command_receipt: optimisticReceipt }
+            : item
+        )
       );
       setStageOverrides((prev) => ({ ...prev, [card.id]: 'resolved' }));
 
       try {
-        await postBoardAction({
+        const cmd = await postBoardAction({
           operation: 'done',
           id: card.id,
           ...(reason ? { note: `Completed: ${reason}` } : {}),
         });
+        if (cmd?.command_receipt) {
+          setBoardItems((prev) =>
+            prev.map((item) =>
+              item.id === card.id ? { ...item, command_receipt: cmd.command_receipt } : item
+            )
+          );
+        }
         showToast(`Marked #${card.id} done`, false, async () => {
           setBoardItems((prev) =>
             prev.map((item) => (item.id === card.id ? { ...item, status: prevStatus || 'open' } : item))
@@ -242,7 +264,11 @@ export default function App() {
   const handleCardReopen = useCallback(
     async (card: BoardCardItem) => {
       setBoardItems((prev) =>
-        prev.map((item) => (item.id === card.id ? { ...item, status: 'open', auto_resolved_candidate: false } : item))
+        prev.map((item) =>
+          item.id === card.id
+            ? { ...item, status: 'open', auto_resolved_candidate: false }
+            : item
+        )
       );
       setStageOverrides((prev) => ({ ...prev, [card.id]: 'open' }));
       try {
@@ -265,7 +291,14 @@ export default function App() {
         setStageOverrides((prev) => ({ ...prev, [card.id]: 'in_progress' }));
       }
       try {
-        await postBoardAction({ operation: 'assign', id: card.id, value: ownerKey });
+        const cmd = await postBoardAction({ operation: 'assign', id: card.id, value: ownerKey });
+        if (cmd?.command_receipt) {
+          setBoardItems((prev) =>
+            prev.map((item) =>
+              item.id === card.id ? { ...item, command_receipt: cmd.command_receipt } : item
+            )
+          );
+        }
         const ownerName = team.find((m) => m.key === ownerKey)?.name || (ownerKey ? ownerKey : 'Unassigned');
         showToast(`Assigned #${card.id} to ${ownerName}`);
       } catch (err: any) {
@@ -424,26 +457,50 @@ export default function App() {
     [postBoardAction, showToast, loadBoardData]
   );
 
-  const handleOpenEmailThread = useCallback(
+  const handleRetryCommand = useCallback(
+    async (commandId: number, cardId: number) => {
+      try {
+        const res = await apiFetch('/api/commands/retry', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id: commandId, confirm: true }),
+        });
+        if (!res.ok) throw new Error('Could not retry command');
+        showToast(`Re-queued sync command #${commandId} for card #${cardId}`);
+        await loadBoardData();
+      } catch (err: any) {
+        showToast(err?.message || 'Retry failed', true);
+      }
+    },
+    [apiFetch, showToast, loadBoardData]
+  );
+
+  // Enhancement 3: Open Split-Pane Claim & Email Inspector Drawer
+  const handleOpenInspector = useCallback(
     async (card: BoardCardItem) => {
-      setActiveThreadCard(card);
+      setInspectorCard(card);
       setActiveThreadData(null);
+      setInspectorNoteText('');
+      setPrepDraftInstruction('');
+      if (!threadIds.has(card.id)) {
+        setLoadingThread(false);
+        return;
+      }
       setLoadingThread(true);
       try {
         const res = await apiFetch(`/api/thread?id=${card.id}`);
         if (!res.ok) throw new Error('Could not load email chain');
         const data = await res.json();
         setActiveThreadData(data);
-      } catch (err: any) {
-        showToast(err?.message || 'Could not load email thread', true);
+      } catch {
+        setActiveThreadData(null);
       } finally {
         setLoadingThread(false);
       }
     },
-    [apiFetch, showToast]
+    [apiFetch, threadIds]
   );
 
-  // To-Do actions (works for ALL roster members: Frank, Mark, Steve, Katherine, Shayan, Dom)
   const submitTodoAction = useCallback(
     async (taskId: string, verb: string, payload: Record<string, unknown>) => {
       const eventId = `ui-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
@@ -506,6 +563,42 @@ export default function App() {
     return Array.from(groups.values());
   }, [todos, showCompletedTodos]);
 
+  // Linked sibling cards & todos for the Split-Pane Inspector
+  const inspectorSiblings = useMemo(() => {
+    if (!inspectorCard) return [];
+    if (!inspectorCard.claim_group) return [];
+    return boardItems.filter(
+      (i) => i.claim_group === inspectorCard.claim_group && i.id !== inspectorCard.id
+    );
+  }, [inspectorCard, boardItems]);
+
+  const inspectorLinkedTodos = useMemo(() => {
+    if (!inspectorCard) return [];
+    const cardSurname = extractCanonicalSurname(
+      inspectorCard.brief?.client || inspectorCard.claim_label || ''
+    );
+    if (!cardSurname) return [];
+    return todos.filter((t) => {
+      const todoSurname = extractCanonicalSurname(t.client || t.section);
+      return todoSurname === cardSurname;
+    });
+  }, [inspectorCard, todos]);
+
+  // Command Palette filtered results
+  const commandPaletteItems = useMemo(() => {
+    const q = commandQuery.trim().toLowerCase();
+    const matchingCards = enrichedItems
+      .filter((c) => {
+        if (!q) return true;
+        const hay = `#${c.id} ${cardTitle(c)} ${c.brief?.client || ''} ${c.brief?.claim || ''} ${
+          c.mailbox || ''
+        }`.toLowerCase();
+        return hay.includes(q);
+      })
+      .slice(0, 6);
+    return matchingCards;
+  }, [enrichedItems, commandQuery]);
+
   const summaryStats = useMemo(() => {
     const open = boardItems.filter((i) => i.status !== 'done' && i.status !== 'snoozed');
     return {
@@ -551,8 +644,23 @@ export default function App() {
             </div>
           </div>
 
-          {/* Navigation Tabs & Active Roster Identity Switcher */}
+          {/* Navigation Tabs, ⌘K Trigger & Active Roster Identity Switcher */}
           <div className="flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => {
+                setCommandPaletteOpen(true);
+                setCommandQuery('');
+              }}
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200/90 cursor-pointer"
+            >
+              <Search className="w-3.5 h-3.5 text-slate-500" />
+              <span>Quick Jump or Command...</span>
+              <kbd className="px-1.5 py-0.5 rounded bg-white border border-slate-300 text-[10px] font-mono text-slate-700">
+                ⌘K
+              </kbd>
+            </button>
+
             <nav className="inline-flex p-1 rounded-lg bg-slate-100 border border-slate-200/80">
               <button
                 type="button"
@@ -580,7 +688,6 @@ export default function App() {
               </button>
             </nav>
 
-            {/* Roster Identity Switcher (verifies Fix 3: Steve, Katherine, Shayan, Dom can act) */}
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-50 border border-slate-200 text-xs">
               <Users className="w-3.5 h-3.5 text-slate-500" />
               <span className="text-slate-500 font-medium">Viewing as:</span>
@@ -660,7 +767,12 @@ export default function App() {
             onAutoCloseHandled={handleAutoCloseHandled}
             onBulkDone={handleBulkDone}
             onMergeClaimDuplicates={handleMergeClaimDuplicates}
-            onOpenEmailThread={handleOpenEmailThread}
+            onOpenEmailThread={handleOpenInspector}
+            onRetryCommand={handleRetryCommand}
+            onOpenCommandPalette={() => {
+              setCommandPaletteOpen(true);
+              setCommandQuery('');
+            }}
           />
         ) : (
           /* Shared To-Do v2 View with Canonical Client Grouping & Show Completed Toggle */
@@ -773,9 +885,7 @@ export default function App() {
                             onClick={async () => {
                               try {
                                 await submitTodoAction(item.id, 'toggle', { done: !item.done });
-                                showToast(
-                                  item.done ? 'Reopened task' : 'Completed task'
-                                );
+                                showToast(item.done ? 'Reopened task' : 'Completed task');
                               } catch (err: any) {
                                 showToast(err?.message || 'Could not toggle task', true);
                               }
@@ -843,45 +953,365 @@ export default function App() {
         )}
       </main>
 
-      {/* Email Thread Modal */}
-      {activeThreadCard && (
-        <div className="fixed inset-0 z-40 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl border border-slate-200 shadow-xl max-w-2xl w-full max-h-[82vh] flex flex-col overflow-hidden">
-            <header className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
-              <div>
-                <span className="text-xs font-mono font-bold text-slate-500">
-                  Card #{activeThreadCard.id} · Email Thread
-                </span>
-                <h3 className="text-sm font-bold text-slate-900">
-                  {activeThreadData?.subject || cardTitle(activeThreadCard)}
-                </h3>
+      {/* Enhancement 3: Split-Pane Claim & Email Inspector Slide-Over Drawer */}
+      {inspectorCard && (
+        <div className="fixed inset-0 z-40 bg-slate-900/35 backdrop-blur-2xs flex justify-end">
+          <aside
+            aria-label="Split-pane claim and email inspector"
+            className="bg-white w-full max-w-xl h-full border-l border-slate-200 shadow-2xl flex flex-col overflow-hidden"
+          >
+            {/* Inspector Header */}
+            <header className="px-5 py-4 border-b border-slate-200 bg-slate-50/70 flex items-start justify-between gap-3">
+              <div className="space-y-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="font-mono text-xs font-bold text-slate-600">
+                    #{inspectorCard.id}
+                  </span>
+                  {inspectorCard.brief?.client && (
+                    <span className="px-2 py-0.5 rounded text-xs font-bold bg-blue-50 text-blue-800 border border-blue-200">
+                      {inspectorCard.brief.client}
+                    </span>
+                  )}
+                  {inspectorCard.brief?.claim && (
+                    <span className="px-2 py-0.5 rounded text-xs font-semibold bg-slate-100 text-slate-700 border border-slate-200">
+                      {inspectorCard.brief.claim}
+                    </span>
+                  )}
+                  {inspectorCard.brief?.amount && (
+                    <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                      {inspectorCard.brief.amount}
+                    </span>
+                  )}
+                </div>
+                <h2 className="text-base font-bold text-slate-900 leading-snug">
+                  {cardTitle(inspectorCard)}
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Carrier: <strong className="text-slate-700">{detectCarrier(inspectorCard)}</strong> ·
+                  Mailbox: <strong className="font-mono text-slate-700">{inspectorCard.mailbox || 'default'}</strong>
+                </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setActiveThreadCard(null)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                {inspectorCard.status !== 'done' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      handleCardDone(inspectorCard);
+                      setInspectorCard(null);
+                    }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer"
+                  >
+                    ✓ Mark Done
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setInspectorCard(null)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </header>
-            <div className="p-5 overflow-y-auto space-y-3 flex-1">
-              {loadingThread ? (
-                <p className="text-xs text-slate-500">Loading email messages...</p>
-              ) : activeThreadData?.messages?.length ? (
-                activeThreadData.messages.map((msg, i) => (
-                  <div key={i} className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1.5">
-                    <div className="flex items-center justify-between text-xs text-slate-500 font-semibold">
-                      <span className="text-slate-800">{msg.from}</span>
-                      <span>{new Date(msg.date).toLocaleString()}</span>
-                    </div>
-                    <p className="text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">
-                      {msg.body}
-                    </p>
+
+            {/* Inspector Scrollable Body */}
+            <div className="flex-1 overflow-y-auto p-5 space-y-5">
+              {/* Ask Aries to Prep Follow-Up */}
+              <div className="p-3.5 rounded-xl bg-violet-50/70 border border-violet-200 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-violet-950 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-violet-700" />
+                    Ask Aries to Draft Follow-Up or Prep Claim
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={prepDraftInstruction}
+                    onChange={(e) => setPrepDraftInstruction(e.target.value)}
+                    placeholder="e.g. Draft follow-up email to adjuster requesting ACV check tracking..."
+                    className="flex-1 px-3 py-1.5 rounded-lg text-xs bg-white border border-violet-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const note =
+                        prepDraftInstruction.trim() ||
+                        `Prep follow-up draft for ${cardTitle(inspectorCard)}`;
+                      try {
+                        await postBoardAction({
+                          operation: 'prep',
+                          id: inspectorCard.id,
+                          note,
+                        });
+                        setPrepDraftInstruction('');
+                        showToast(`Queued Aries prep for #${inspectorCard.id}`);
+                      } catch (err: any) {
+                        showToast(err?.message || 'Could not queue prep', true);
+                      }
+                    }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-bold bg-violet-700 hover:bg-violet-800 text-white shrink-0 cursor-pointer"
+                  >
+                    Queue Prep
+                  </button>
+                </div>
+              </div>
+
+              {/* Source Email Thread Section */}
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                  <Mail className="w-3.5 h-3.5" />
+                  Source Email Chain
+                </h3>
+                {loadingThread ? (
+                  <p className="text-xs text-slate-500">Loading email messages...</p>
+                ) : activeThreadData?.messages?.length ? (
+                  <div className="space-y-2.5">
+                    {activeThreadData.messages.map((msg, i) => {
+                      const isOurs = /flood\.doctor|flooddoctorva|restorationdoctors/i.test(msg.from);
+                      return (
+                        <div
+                          key={i}
+                          className={`p-3.5 rounded-xl border space-y-1.5 ${
+                            isOurs
+                              ? 'bg-emerald-50/40 border-emerald-200 ml-4'
+                              : 'bg-slate-50 border-slate-200 mr-4'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between text-xs font-semibold">
+                            <span className={isOurs ? 'text-emerald-900' : 'text-slate-800'}>
+                              {msg.from} {isOurs ? '(Our Team)' : '(Inbound)'}
+                            </span>
+                            <span className="text-[11px] text-slate-400">
+                              {new Date(msg.date).toLocaleString()}
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">
+                            {msg.body}
+                          </p>
+                        </div>
+                      );
+                    })}
                   </div>
-                ))
-              ) : (
-                <p className="text-xs text-slate-500">No messages stored for this card.</p>
+                ) : (
+                  <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600 space-y-1.5">
+                    {inspectorCard.brief?.last_theirs && (
+                      <div>
+                        <strong className="text-slate-800">
+                          Last Inbound ({inspectorCard.brief.last_theirs.by}):
+                        </strong>{' '}
+                        {inspectorCard.brief.last_theirs.what}
+                      </div>
+                    )}
+                    {inspectorCard.brief?.last_ours && (
+                      <div>
+                        <strong className="text-emerald-800">
+                          Our Last Reply ({inspectorCard.brief.last_ours.by}):
+                        </strong>{' '}
+                        {inspectorCard.brief.last_ours.what}
+                      </div>
+                    )}
+                    {!inspectorCard.brief?.last_theirs && !inspectorCard.brief?.last_ours && (
+                      <p className="text-slate-400">No full email transcript attached to this card.</p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Unified Claim Group Timeline (Sibling Cards + Linked Shared To-Do Tasks) */}
+              {(inspectorSiblings.length > 0 || inspectorLinkedTodos.length > 0) && (
+                <div className="space-y-2.5">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                    <FolderGit2 className="w-3.5 h-3.5" />
+                    Unified Claim Group ({inspectorSiblings.length} sibling cards ·{' '}
+                    {inspectorLinkedTodos.length} linked To-Dos)
+                  </h3>
+
+                  {inspectorSiblings.map((sib) => (
+                    <div
+                      key={sib.id}
+                      onClick={() => handleOpenInspector(sib)}
+                      className="p-3 rounded-lg bg-blue-50/40 hover:bg-blue-50 border border-blue-200/80 flex items-center justify-between gap-2 cursor-pointer"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-slate-900 truncate">
+                          #{sib.id} · {cardTitle(sib)}
+                        </div>
+                        <div className="text-[11px] text-slate-500">
+                          Owner: {sib.assignee || 'Unassigned'} · Status: {sib.status || 'open'}
+                        </div>
+                      </div>
+                      <span className="text-xs font-semibold text-blue-700 shrink-0">Inspect →</span>
+                    </div>
+                  ))}
+
+                  {inspectorLinkedTodos.map((todo) => (
+                    <div
+                      key={todo.id}
+                      className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className={todo.done ? 'text-emerald-600 font-bold' : 'text-slate-400'}>
+                          {todo.done ? '✓' : '○'}
+                        </span>
+                        <span className={todo.done ? 'line-through text-slate-400 truncate' : 'font-semibold text-slate-800 truncate'}>
+                          To-Do: {todo.text}
+                        </span>
+                      </div>
+                      <span className="text-[11px] text-slate-500 shrink-0">
+                        {todo.assignee || 'Unassigned'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               )}
+
+              {/* Add Note Form */}
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  if (!inspectorNoteText.trim()) return;
+                  const note = inspectorNoteText.trim();
+                  try {
+                    await postBoardAction({
+                      operation: 'note',
+                      id: inspectorCard.id,
+                      note,
+                    });
+                    setInspectorNoteText('');
+                    showToast(`Added note to #${inspectorCard.id}`);
+                    await loadBoardData();
+                  } catch (err: any) {
+                    showToast(err?.message || 'Could not save note', true);
+                  }
+                }}
+                className="space-y-2 pt-2 border-t border-slate-200"
+              >
+                <label className="block text-xs font-bold uppercase tracking-wider text-slate-400">
+                  Add Operational Note
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={inspectorNoteText}
+                    onChange={(e) => setInspectorNoteText(e.target.value)}
+                    placeholder="Record call outcome, check number, or adjuster promise..."
+                    className="flex-1 px-3 py-1.5 rounded-lg text-xs bg-slate-50 border border-slate-200 focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                  <button
+                    type="submit"
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white cursor-pointer"
+                  >
+                    <Send className="w-3 h-3" />
+                    Save Note
+                  </button>
+                </div>
+              </form>
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {/* Enhancement 1: Global Command Palette (`⌘K`) Modal */}
+      {commandPaletteOpen && (
+        <div
+          onClick={() => setCommandPaletteOpen(false)}
+          className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-start justify-center pt-20 p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-label="Command Palette"
+            className="bg-white rounded-xl border border-slate-200 shadow-2xl max-w-lg w-full overflow-hidden"
+          >
+            <div className="p-3.5 border-b border-slate-200 flex items-center gap-2.5">
+              <Command className="w-4 h-4 text-slate-400" />
+              <input
+                type="search"
+                autoFocus
+                value={commandQuery}
+                onChange={(e) => setCommandQuery(e.target.value)}
+                placeholder="Jump to claim #, client, address, or run a command..."
+                className="flex-1 text-sm font-medium text-slate-900 focus:outline-none"
+              />
+              <kbd className="px-1.5 py-0.5 rounded bg-slate-100 text-[10px] font-mono text-slate-500">
+                ESC
+              </kbd>
+            </div>
+
+            <div className="max-h-96 overflow-y-auto p-2 space-y-3">
+              {/* Quick Operational Actions */}
+              <div>
+                <div className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  Quick Actions
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCommandPaletteOpen(false);
+                    handleAutoCloseHandled();
+                  }}
+                  className="w-full px-3 py-2 rounded-lg text-left text-xs font-semibold text-emerald-800 hover:bg-emerald-50 flex items-center justify-between cursor-pointer"
+                >
+                  <span className="flex items-center gap-2">
+                    <Zap className="w-3.5 h-3.5 text-emerald-600" />
+                    Auto-Close All Handled Threads ({summaryStats.readyCount})
+                  </span>
+                  <span className="text-[11px] text-emerald-600">Run now →</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCommandPaletteOpen(false);
+                    setActiveTab(activeTab === 'board' ? 'todos' : 'board');
+                  }}
+                  className="w-full px-3 py-2 rounded-lg text-left text-xs font-semibold text-slate-700 hover:bg-slate-100 flex items-center justify-between cursor-pointer"
+                >
+                  <span>
+                    Switch to {activeTab === 'board' ? 'Shared To-Do List (v2)' : 'Kanban Operations Board'}
+                  </span>
+                  <span className="text-[11px] text-slate-400">View →</span>
+                </button>
+              </div>
+
+              {/* Matching Claim Cards */}
+              <div>
+                <div className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  Matching Cards
+                </div>
+                {commandPaletteItems.length === 0 ? (
+                  <p className="px-3 py-2 text-xs text-slate-400">No matching cards found.</p>
+                ) : (
+                  commandPaletteItems.map((card) => (
+                    <button
+                      key={card.id}
+                      type="button"
+                      onClick={() => {
+                        setCommandPaletteOpen(false);
+                        setActiveTab('board');
+                        handleOpenInspector(card);
+                      }}
+                      className="w-full px-3 py-2 rounded-lg text-left hover:bg-slate-100 flex items-center justify-between gap-2 cursor-pointer"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-slate-900 truncate">
+                          #{card.id} · {cardTitle(card)}
+                        </div>
+                        <div className="text-[11px] text-slate-500 truncate">
+                          {card.brief?.client || 'No client'} · {card.brief?.claim || 'No claim #'} · Owner:{' '}
+                          {card.assignee || 'Unassigned'}
+                        </div>
+                      </div>
+                      {card.brief?.amount && (
+                        <span className="px-1.5 py-0.5 rounded text-[11px] font-mono font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 shrink-0">
+                          {card.brief.amount}
+                        </span>
+                      )}
+                    </button>
+                  ))
+                )}
+              </div>
             </div>
           </div>
         </div>
