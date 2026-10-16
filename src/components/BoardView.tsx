@@ -77,6 +77,7 @@ export interface TeamMember {
 }
 
 export type KanbanStatus = 'Open' | 'In Progress' | 'Resolved';
+export type KanbanSortOption = 'urgent' | 'created' | 'assignee';
 
 export interface BoardViewProps {
   items: BoardCardItem[];
@@ -225,6 +226,7 @@ export const BoardView: React.FC<BoardViewProps> = ({
   const [quickFilter, setQuickFilter] = useState<'all' | 'mine' | 'ready' | 'urgent' | 'unassigned' | 'stale'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [ownerFilter, setOwnerFilter] = useState('');
+  const [sortBy, setSortBy] = useState<KanbanSortOption>('urgent');
   const [groupByClaim, setGroupByClaim] = useState(true);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [expandedCards, setExpandedCards] = useState<Set<number>>(new Set());
@@ -291,15 +293,45 @@ export const BoardView: React.FC<BoardViewProps> = ({
       const col = deriveKanbanColumn(item);
       map[col].push(item);
     }
+
+    const ownerNameMap = new Map(team.map((m) => [m.key.toLowerCase(), m.name.toLowerCase()]));
+    const getCreatedTime = (card: BoardCardItem): number => {
+      const raw = card.created || card.updated || '';
+      const parsed = raw ? Date.parse(raw) : NaN;
+      return Number.isFinite(parsed) ? parsed : card.id;
+    };
+    const getAssigneeLabel = (card: BoardCardItem): string => {
+      const key = String(card.assignee || '').trim().toLowerCase();
+      if (!key) return '\uffff'; // Sort unassigned after assigned
+      return ownerNameMap.get(key) || key;
+    };
+
     for (const col of ['Open', 'In Progress', 'Resolved'] as KanbanStatus[]) {
       map[col].sort((a, b) => {
+        if (sortBy === 'created') {
+          const timeDiff = getCreatedTime(b) - getCreatedTime(a);
+          if (timeDiff !== 0) return timeDiff;
+          return b.id - a.id;
+        }
+        if (sortBy === 'assignee') {
+          const ownerA = getAssigneeLabel(a);
+          const ownerB = getAssigneeLabel(b);
+          const cmp = ownerA.localeCompare(ownerB);
+          if (cmp !== 0) return cmp;
+          const urgDiff = Number(isUrgentCard(b)) - Number(isUrgentCard(a));
+          if (urgDiff !== 0) return urgDiff;
+          return b.id - a.id;
+        }
+        // Default: 'urgent'
         const urgDiff = Number(isUrgentCard(b)) - Number(isUrgentCard(a));
         if (urgDiff !== 0) return urgDiff;
+        const timeDiff = getCreatedTime(b) - getCreatedTime(a);
+        if (timeDiff !== 0) return timeDiff;
         return b.id - a.id;
       });
     }
     return map;
-  }, [filteredItems]);
+  }, [filteredItems, sortBy, team]);
 
   const claimGroupsMap = useMemo(() => {
     const map = new Map<string, BoardCardItem[]>();
@@ -898,13 +930,31 @@ export const BoardView: React.FC<BoardViewProps> = ({
               <option value="aries">Aries</option>
             </select>
 
-            {(quickFilter !== 'all' || searchQuery || ownerFilter) && (
+            <div className="inline-flex items-center gap-1.5">
+              <label htmlFor="kanban-sort-select" className="text-xs font-semibold text-slate-500">
+                Sort by:
+              </label>
+              <select
+                id="kanban-sort-select"
+                aria-label="Sort cards"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as KanbanSortOption)}
+                className="px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-50 border border-slate-200 text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer"
+              >
+                <option value="urgent">Urgent</option>
+                <option value="created">Date Created</option>
+                <option value="assignee">Assignee</option>
+              </select>
+            </div>
+
+            {(quickFilter !== 'all' || searchQuery || ownerFilter || sortBy !== 'urgent') && (
               <button
                 type="button"
                 onClick={() => {
                   setQuickFilter('all');
                   setSearchQuery('');
                   setOwnerFilter('');
+                  setSortBy('urgent');
                 }}
                 className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold text-slate-500 hover:text-slate-800 cursor-pointer"
               >
